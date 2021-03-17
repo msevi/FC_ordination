@@ -25,17 +25,17 @@ opts_knit$set(width=75)
 ## Load libraries
 [`PhenoFlow`](https://github.com/rprops/PhenoFlow) is used to process data. The aim of this package is to obtain diversity estimates from FC data. It requires several FC oriented packages such as `flowViz` and `flowCore`, as well as community ecology package `vegan`, see their github `libraries.R` script for package download.  
 
-Alternatively, the `Phenoflow` functions can be sourced from `MRM.parameters.R`, wich have slightly different names and input arguments in some cases.  The Rscript `Fingerprint.R` is also included in this github repository, and was used to guide the FC analyses shown here.
+Alternatively, the `Phenoflow` functions can be sourced from `MRM.parameters.R`, which have slightly different names and input arguments in some cases.  The`Fingerprint.R` Rscript is also included in this github repository, and was used to guide the FC analyses shown below and [here](http://rprops.github.io/PhenoFlow/).
 
-```{r load_libraries, warning=FALSE, message=FALSE}
+```{r load_libraries}
 library(Phenoflow)
 source("MRM.parameters.R") 
 
 library(tidyverse) 
+library(magrittr)
 
 library(skimr)
 library(GGally)
-library(magrittr)
 
 library(factoextra)
 ```
@@ -61,7 +61,7 @@ The following hint can help you when selecting samples in batch from your termin
 `while read file; do cp "$file" selected; done < selected_TCC_list_files`  
 
 
-```{r data_in, warning=FALSE, message=FALSE}
+```{r data_in}
 flowData <- flowCore::read.flowSet(path = "data/Run001_060420_060520", pattern=".fcs") 
 EnvData <- readxl::read_excel("data/sample.database.xlsx", sheet = "Chemical_data") 
 ```
@@ -70,9 +70,9 @@ EnvData <- readxl::read_excel("data/sample.database.xlsx", sheet = "Chemical_dat
 
 It's always important to explore the data prior to any analyses (e.g., look at the distribution of the data).
 
-For environmental data, we can look at the structure of the dataframe using base functions. However, there are more sophisticated functions from packages like `skimr` and `GGally` that we can use to obtain additional information quickly. 
+For **environmental data**, we can look at the structure of the dataframe using base functions. However, there are more sophisticated functions from packages like `skimr` and `GGally` that we can use to obtain additional information quickly. 
 
-To explore FC data, we need to learn about flowSet objects.
+To explore **FC data**, we need to learn about flowSet objects.
 
 Classes in `flowCore`  
 
@@ -93,17 +93,17 @@ There are several options to work with a flowSet object, such as:
 
 **Side note**: `%<>%` might be a new operator for you. It's from the `magrittr` package and represents pipe and assign.  
 
-```{r explore, warning=FALSE, message=FALSE }
+```{r explore}
 str(EnvData)
 
 skimr::skim(EnvData)
 
 EnvData %<>%  
   tibble::column_to_rownames("Sample.Id") %>% 
-  dplyr::select(Property, ends_with(".R1")) %>% 
+  dplyr::select(Property, Season, ends_with(".R1")) %>% 
   rename_at(vars(ends_with(".R1")), funs(sub(".R1", "",.))) %>% 
   dplyr::select(!ends_with(".carbon")) %>% 
-  dplyr::select(-Total.dissolved.nitrogen, -Total.nitrogen) %>% 
+  dplyr::select(-Total.dissolved.nitrogen, -Total.nitrogen, -Nitrite) %>% 
   dplyr::rename(DO = "Dissolved.oxygen",
                 Chlorine = "Total.chlorine")  
 
@@ -121,6 +121,7 @@ EnvData %<>%
     TRUE ~ Conductivity
   ))
 
+
 ###################################################################
 
 class(flowData)
@@ -132,7 +133,9 @@ flowData[[1]]
 ```
 
 ## Pre-processing
+
 ### Transformations
+
 Environmental data have different units as well as scales, therefore some type of nomalization has to be performed. We will center (subtract variable means from each observation) and scale (multiply each measurement by a scalar factor so that the resulting feature has a variance of one) to ensures equal contribution from each variable.
 
 There's several transformations that can be applied to FC data. In this tutorial, FC data will be transformed by arcsinh, which improves the visualization of data with a low variance and helps data appear more normal by:  
@@ -143,16 +146,24 @@ There's several transformations that can be applied to FC data. In this tutorial
 
 (3) Smooth transition of values between extremes  
 
-```{r transformations, warning=FALSE, message=FALSE}
+```{r transformations}
 EnvData_transformed<- scale(EnvData %>% 
-                              dplyr::select(-Property)) %>% 
+                              dplyr::select(-Property, -Season)) %>% 
   as.data.frame()
 
 GGally::ggpairs(EnvData_transformed)
 
 EnvData_groupings<- EnvData %>% 
-  dplyr::select(Property) %>% 
+  dplyr::select(Property, Season) %>% 
   mutate(category= str_remove(Property, "[:digit:]+"))
+
+EnvData_groupings %>% 
+  group_by(category) %>% 
+  tally
+
+EnvData_groupings %>% 
+  group_by(Season) %>% 
+  tally
 
 ###################################################################
 
@@ -161,20 +172,23 @@ flowData_transformed<- flowCore::transform(flowData,
                                             `SSC-H`=asinh(`SSC-H`), 
                                             `FL3-H`=asinh(`FL3-H`), 
                                             `FSC-H`=asinh(`FSC-H`))
+
+subset_FC_arscsin<- flowData_transformed@frames[["B01 COM02_TCC_TP02_R1.fcs"]]@exprs %>% 
+  as.tibble() %>% 
+  select(`FL1-H`, `FL3-H`, `SSC-H`, `FSC-H`)
+
 ```
 
 
 ### Denoise and gating
-Choose features (i.e., channels) and remove instrument/sample noise with `PolygonGate` function. This function will extract observations bounded by the gate as a subset of the full data set. Further all values will be normalized by green fluorescence channel... WHY?
 
-The `flowBasis` function from `flowFDA` calculates the fingerprints.
-The resulting class represents a flowset by a basis derived from a kernel density estimator using an equally spaced grid.
- K is the kernel — a non-negative function — and h > 0 is a smoothing parameter called the bandwidth
+Choose features (i.e., channels) and remove instrument/sample noise with `PolygonGate` function. This function will extract observations bounded by the gate as a subset of the full data set. Further all values will be normalized by green fluorescence channel.
 
+The `flowBasis` function from `flowFDA` calculates the phenotypic fingerprints.
 
 ```{r denoise_gates}
-param<- c("FL1-H", "FL3-H","SSC-H","FSC-H")
-sqrcut1 <- matrix(c(8.75,8.75,14,14,3,7.5,14,3),ncol=2, nrow=4) # gate coordinates in format: c(x,x,x,x,y,y,y,y) ##how were these coordinate chosen
+param<- c("FL1-H", "FL3-H","SSC-H","FSC-H") #green, red, scatter - height
+sqrcut1 <- matrix(c(8.75,8.75,14,14,3,7.5,14,3),ncol=2, nrow=4) # gate coordinates in format: c(x,x,x,x,y,y,y,y) 
 colnames(sqrcut1) <- c("FL1-H","FL3-H")
 polyGate1 <- flowCore::polygonGate(.gate=sqrcut1, filterId = "Total Cells")
 
@@ -190,11 +204,16 @@ flowViz::xyplot(`FL3-H` ~ `FL1-H`,
 
 # Isolate only the cellular information based on the polyGate1
 flowData_transformed <- flowCore::Subset(flowData_transformed, polyGate1)
+
+subset_FC_arscsin_gate<- flowData_transformed@frames[["B01 COM02_TCC_TP02_R1.fcs"]]@exprs %>% 
+  as.tibble() %>% 
+  select(`FL1-H`, `FL3-H`, `SSC-H`, `FSC-H`)
+
 summary <- flowCore::fsApply(x = flowData_transformed, 
                    FUN = function(x) apply(x, 2, max), 
                    use.exprs = TRUE) #for each channel obtain max value
 
-maxval <- max(summary[,"FL1-H"])  #extract max value corresponding to green fluorescent channel
+maxval <- max(summary[,"FL1-H"])  #extract max value corresponding to green fluorescent channel out of all samples
 mytrans <- function(x) x/maxval
 
 flowData_transformed <- flowCore::transform(flowData_transformed,
@@ -203,6 +222,11 @@ flowData_transformed <- flowCore::transform(flowData_transformed,
                                   `SSC-H`=mytrans(`SSC-H`),
                                   `FSC-H`=mytrans(`FSC-H`))
 
+subset_FC_arscsin_gate_maxG<- flowData_transformed@frames[["B01 COM02_TCC_TP02_R1.fcs"]]@exprs %>% 
+  as.tibble() %>% 
+  select(`FL1-H`, `FL3-H`, `SSC-H`, `FSC-H`)
+
+#Fingerprints
 fbasis<- flowFDA::flowBasis(flowData_transformed, 
                            param, #channels for which the bivariate density basis are derived
                            nbin=128, #Number of bins that are taken in each channel to approximate the bivariate densities
@@ -224,11 +248,11 @@ res.pca <- prcomp(EnvData_transformed) #we can also use the scale and center arg
 res.pca2 <- vegan::rda(EnvData_transformed) #another option
 
 res.pca
-res.pca2
+summary(res.pca2)
 
 fviz_eig(res.pca) #scree plot
 
-##Extract eigenvalues
+##Extract eigenvalues (variance, stretching)
 Eigenvalues.pca <- vegan::eigenvals(res.pca) 
 
 Eigenvalues.pca[Eigenvalues.pca>mean(Eigenvalues.pca)] #Kaiser-Guttman
@@ -239,7 +263,7 @@ Variance.pca.1 <- as.numeric(100 * signif(Variance.pca[1], 4))
 Variance.pca.2<- as.numeric(100 * signif(Variance.pca[2], 4)) 
 Variance.pca.3<- as.numeric(100 * signif(Variance.pca[3], 4)) 
 
-##Extract loadings (variable coordinates)
+##Extract loadings (Eigenvectors, variable coordinates)
 loadings.pca <- res.pca$rotation
 
 ##Standard deviation information
@@ -286,6 +310,14 @@ res.pca.out <- res.pca$x[,c("PC1", "PC2")] %>%
 We will visualize the PCA as a biplot, where samples are positioned in terms of PC1 and PC2 (i.e., observations) and the initial variables are mapped onto the plot as well. With this type of graphs, you can explore the trends in the data samples and features simultaneously.
 
 Because eigenvalues reflect the variance in coordinates of the associated PCs, you only need to ensure that in the plots, one "unit" in direction of one PC has the same length as one "unit" in direction of another PC. (If you use ggplot2 R package for generating plots, adding + coord_fixed(1) will ensure a correct aspect ratio.)
+
+The interpretation of the PCA biplot (loadings + scores):  
+    * variables association with principal components  
+    * variable relationships among themselves:  
+        - Descriptors at 180 degrees of each other are negatively correlated  
+        - Descriptors at 90 degrees of each other have zero correlation  
+        - Descriptors at 0 degrees of each other are positively correlated  
+        
 
 **Side note**: snippets help you type less! 
 ```{r PCA_viz}
@@ -346,53 +378,106 @@ p2 <- ggplot() +
 p 
 
 p2
+
+p3<-  ggplot() +
+  geom_point(data= res.pca.out, aes(PC1, PC2, color=Season), alpha=0.7, size=6) +
+  geom_hline(yintercept = 0, linetype = 'dotted') +
+  geom_vline(xintercept = 0, linetype = 'dotted') +
+  geom_segment(data= data_arrow,
+               aes(x = 0, y = 0, xend = PC1, yend = PC2),
+               arrow = arrow(length = unit(0.1, "inches")),
+               lineend = "round",
+               linejoin = "round",
+               color= "gray") +
+  geom_text(data= data_arrow, 
+            aes(x=PC1, y=PC2, label=variable), 
+            hjust = 'outside', 
+            nudge_x = 0.2,
+            color= "gray") +
+  xlab(paste0("PC1 (", Variance.pca.1, "%)")) +
+  ylab(paste0("PC2 (", Variance.pca.2, "%)")) +
+  scale_color_manual(values=c("grey1","#990000")) + 
+  scale_shape_manual(values = c(16,16)) + 
+  labs(title = "PCA", subtitle = "ENVIRONMENTAL FACTORS") +
+  theme_bw(base_size = 14) +
+  theme(plot.title = element_text(face="bold", size=16),
+  legend.title = element_text(face="plain", size=14),
+  plot.subtitle = element_text(face="bold", size=14, 
+  color="azure4"),
+  legend.position = "right") +
+  coord_fixed(1)
+
+p3
 ```
 
 ## PCoA
 
 The PCoA for FC data preserves Bray-Curtis distances and results from a matrix of features corresponding to the previously chosen parameters (i.e., "FL1-H", "FL3-H","SSC-H","FSC-H").  
 
-The matrix of parameters can be extracted from `fbasis@basis` 
+This calculation corresponds to beta-analyses of the fingerprints, using density values. 
+
+The matrix of parameters can be extracted from `fbasis@basis` with 231 samples and 50 features
+
+According to Props et al. 2016
+
+> Phenoflow: data processing pipeline that ﬁts [**bivariate kernel density functions**](https://machinelearningmastery.com/probability-density-estimation/) to phenotypic parameter combinations of an entire microbial community and concatenates them to a single one-dimensional phenotypic ﬁngerprint. By calculating established diversity metrics from such phenotypic ﬁngerprints, we construct an alternative interpretation of the microbial diversity that incorporates distinct phenotypic traits underlying cell-to-cell heterogeneity (i.e. morphology and nucleic acid content)
 
 ```{r PCoA}
-flowDataBD <- beta.div.fcm(fbasis,
+PCoA_mat<- fbasis@basis
+
+flowDataBC <- beta.div.fcm(fbasis,
                            n=1,
-                           ord.type="PCoA") # sourced function, based on Bray-Curtis distances, unsing cmdscale
+                           ord.type="PCoA") # sourced function, based on Bray-Curtis distances, using cmdscale (stats)
 
-str(flowDataBD)
+str(flowDataBC)
+class(flowDataBC)
+
+Variance.pcoa <- vegan::eigenvals(flowDataBC)/sum(vegan::eigenvals(flowDataBC))
 
 
-flowDataBD_PCApoints <- flowDataBD %>% 
+flowData_groupings<- readxl::read_excel("data/sample.database.xlsx", sheet = "Chemical_data") %>% 
+  select(Property, Time.point, Replicate, Season) %>% 
+  rename(Time.Point = "Time.point",
+         Location = "Property") %>% 
+  mutate(Replicate=str_remove(Replicate, "0"))
+
+flowDataBC_PCoApoints <- flowDataBC %>% 
   purrr::simplify() %>% 
   dplyr::first() %>% 
   as.data.frame() %>% 
   tibble::rownames_to_column("fcs.id") %>% 
   rename(PC1 = "V1",
          PC2 = "V2") %>% 
-  tidyr::separate(fcs.id, into = c("Well","col01"),sep=" ") %>%
-  tidyr::separate(col01, into = c("Location","Stain","TimePoint","Replicate"),sep="_") %>%
-  tidyr::separate(Replicate, into = c("replicate","col06"),sep=".fcs") %>% 
+  tidyr::separate(fcs.id, into = c("Well","col01"), sep=" ") %>%
+  tidyr::separate(col01, into = c("Location","Stain","Time.Point","Replicate"),sep="_") %>%
+  tidyr::separate(Replicate, into = c("Replicate","col06"),sep=".fcs") %>% 
   select(-col06) %>% 
   mutate(Site= case_when(
     grepl("COM", Location) ~ "Commercial",
     TRUE ~ "Residential"
   )) %>%
   dplyr::filter(Stain == "TCC") %>%
-  dplyr::filter(TimePoint %in% c("TP01","TP02","TP03","TP04","TP05","TP06","TP07"))
+  dplyr::filter(Time.Point %in% c("TP01","TP02","TP03","TP04","TP05","TP06","TP07")) %>% 
+  left_join(flowData_groupings)
   
 ```
 
 ### Visualization
 
+Interpretation of a PCoA plot is straightforward: objects ordinated closer to one another are more similar than those ordinated further away. 
+
+
 ```{r PCA_plot}
-p3<- ggplot(flowDataBD_PCApoints, aes(x = PC1, y = PC2)) + 
+p4<- ggplot(flowDataBC_PCoApoints, aes(x = PC1, y = PC2)) + 
   geom_point(size = 4, aes(colour = Site), alpha =0.7)+
   theme_bw(base_size = 14) +
   theme(plot.title = element_text(face="bold", size=16),legend.title = element_text(face="plain", size=14),plot.subtitle = element_text(face="bold", size=14, color="azure4"),legend.position = "right") + 
-  labs(x = "PC1", colour = "Site", y = "PC2", title = "PCoA", subtitle = "COMMERCIAL & RESIDENTIAL LOCATIONS")  + 
+  labs(x = paste0("PC1 (", round(100*Variance.pcoa[1],2), "%)"), colour = "Site", y = paste0("PC2 (", round(100*Variance.pcoa[2],2), "%)" ), title = "PCoA", subtitle = "COMMERCIAL & RESIDENTIAL LOCATIONS")  + 
   scale_color_manual(values=c("grey1","#990000")) + 
   coord_fixed(1)
 
-p3
+p4
+
+
 ```
 
